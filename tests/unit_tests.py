@@ -2757,6 +2757,149 @@ def check_day_summaries_are_written_and_filled_in():
     print("day-summary storage checks passed (upsert, the previous day, backfill, and its second run)")
 
 
+def check_ticker_http_refuses_a_bad_token_and_pins_a_row():
+    """A wrong token is 401 and the list stays put. Pin marks the ticker, not a contract."""
+    import io
+    import json
+    import socket
+    import threading
+    from contextlib import redirect_stdout
+
+    from app import ticker_http
+
+    secret = "super-secret-token"
+    os.environ["GAMMAGRID_API_TOKEN"] = "   "
+    assert ticker_http.Gate.from_env() is None
+    os.environ["GAMMAGRID_API_TOKEN"] = secret
+    try:
+        gate = ticker_http.Gate.from_env()
+    finally:
+        os.environ.pop("GAMMAGRID_API_TOKEN", None)
+    assert gate is not None
+    assert str(gate) == "redacted" and repr(gate) == "redacted"
+    presented = ticker_http.Presented(secret)
+    assert str(presented) == "redacted" and repr(presented) == "redacted"
+    assert secret not in repr(gate) and secret not in str(presented)
+
+    def raw_request(method, path, token, body=b"", length=None):
+        if length is None:
+            length = len(body)
+        head = (
+            f"{method} {path} HTTP/1.1\r\n"
+            f"Authorization: Bearer {token}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {length}\r\n"
+            "\r\n"
+        )
+        return head.encode("ascii") + body
+
+    def roundtrip(payload: bytes) -> tuple[int, bytes, str]:
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        box: dict[str, str] = {}
+
+        def once():
+            conn, _addr = server.accept()
+            try:
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    ticker_http._handle(conn, gate)
+                box["log"] = buf.getvalue()
+            finally:
+                conn.close()
+                server.close()
+
+        client = socket.create_connection(server.getsockname(), timeout=5)
+        try:
+            client.sendall(payload)
+            client.shutdown(socket.SHUT_WR)
+            thread = threading.Thread(target=once)
+            thread.start()
+            chunks = []
+            while True:
+                data = client.recv(4096)
+                if not data:
+                    break
+                chunks.append(data)
+        finally:
+            client.close()
+        thread.join(timeout=5)
+        raw = b"".join(chunks)
+        head, _, resp_body = raw.partition(b"\r\n\r\n")
+        status = int(head.split(b" ", 2)[1])
+        return status, resp_body, box.get("log", "")
+
+    calls = {"n": 0}
+    original = db.get_connection
+
+    def boom():
+        calls["n"] += 1
+        raise AssertionError("database opened")
+
+    db.get_connection = boom
+    try:
+        status, resp_body, log = roundtrip(raw_request("POST", "/tickers", "wrong", b"not-json"))
+        assert status == 401, (status, resp_body)
+        assert json.loads(resp_body) == {"error": "unauthorized"}
+        assert calls["n"] == 0
+        assert "POST /tickers 401" in log
+        assert secret not in log and "wrong" not in log and "not-json" not in log
+        status, resp_body, log = roundtrip(raw_request("POST", "/tickers", secret, b"not-json"))
+        assert status == 400, (status, resp_body)
+        assert calls["n"] == 0
+        assert "not-json" not in log and secret not in log
+        status, resp_body, log = roundtrip(
+            raw_request("POST", "/tickers", secret, b"x" * 4097, length=4)
+        )
+        assert status == 400, status
+        assert json.loads(resp_body)["message"] == "The request body is too large."
+        assert calls["n"] == 0
+        assert secret not in log
+        status, resp_body, log = roundtrip(
+            raw_request("POST", "/tickers", secret, b"x" * 4097, length=4097)
+        )
+        assert status == 400, (status, resp_body)
+        assert json.loads(resp_body)["message"] == "The request body is too large."
+        assert calls["n"] == 0
+    finally:
+        db.get_connection = original
+
+    from app.watchlist import Add, Remove, Stored, apply, members
+
+    conn = original()
+    try:
+        with testdb.admit_without_asking_the_source():
+            created = apply(conn, Add("HTTPIN"))
+        assert isinstance(created, Stored) and created.created and created.member.pinned is False
+        before = db.get_watchlist(conn)
+        contracts = conn.execute(
+            "SELECT count(*) FROM tracked_contracts WHERE ticker = %s", ("HTTPIN",)
+        ).fetchone()[0]
+        status, resp_body, log = roundtrip(raw_request("POST", "/tickers", "wrong", b"not-json"))
+        assert status == 401 and json.loads(resp_body) == {"error": "unauthorized"}
+        assert db.get_watchlist(conn) == before
+        assert secret not in log and "not-json" not in log
+        status, resp_body, log = roundtrip(
+            raw_request("PATCH", "/tickers/httpin", secret, b'{"pinned":true}')
+        )
+        assert status == 200, (status, resp_body)
+        payload = json.loads(resp_body)
+        assert payload["ticker"] == "HTTPIN" and payload["pinned"] is True
+        assert secret not in log
+        assert db.get_watchlist(conn) == before
+        pinned = [member for member in members(conn) if member.ticker.value == "HTTPIN"]
+        assert len(pinned) == 1 and pinned[0].pinned is True
+        after = conn.execute(
+            "SELECT count(*) FROM tracked_contracts WHERE ticker = %s", ("HTTPIN",)
+        ).fetchone()[0]
+        assert contracts == 0 and after == 0
+    finally:
+        apply(conn, Remove("HTTPIN"))
+        conn.close()
+    print("ticker http checks passed")
+
+
 def main():
     # Start from an empty database, like the other two suites already do. This
     # one did not, and got away with it only because nothing it left behind
@@ -2814,6 +2957,7 @@ def main():
     check_the_day_row_and_the_ladder()
     check_a_day_is_a_session_that_opened()
     check_day_summaries_are_written_and_filled_in()
+    check_ticker_http_refuses_a_bad_token_and_pins_a_row()
     print("\nALL UNIT CHECKS PASSED")
 
 if __name__ == "__main__":
