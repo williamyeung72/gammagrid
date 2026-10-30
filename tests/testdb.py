@@ -54,13 +54,6 @@ def configure() -> str:
 
 @contextmanager
 def admit_without_asking_the_source():
-    """Let a synthetic symbol through apply.
-
-    A new ticker asks the provider. These suites insert names that are not
-    listed anywhere. Asking Yahoo would make the result depend on the network,
-    and a False from that check would refuse the fixture. None still inserts,
-    which is what a provider with no answer does.
-    """
     from app import providers
 
     class Open:

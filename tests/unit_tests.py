@@ -2758,7 +2758,6 @@ def check_day_summaries_are_written_and_filled_in():
 
 
 def check_ticker_http_refuses_a_bad_token_and_pins_a_row():
-    """A wrong token is 401 and the list stays put. Pin marks the ticker, not a contract."""
     import io
     import json
     import socket

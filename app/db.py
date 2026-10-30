@@ -49,7 +49,6 @@ def get_connection() -> psycopg.Connection:
 # --- watchlist ---
 
 def get_watchlist(conn: psycopg.Connection) -> list[str]:
-    """Symbols in ticker order. Pin is not a parameter and not a filter."""
     from app.watchlist import members
 
     return [member.ticker.value for member in members(conn)]

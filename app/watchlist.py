@@ -1,8 +1,7 @@
-"""The watchlist row and the only write to it.
+"""The only write to a watchlist row.
 
-Pin lives on this row. A contract pin is a different table and a different
-command. There is no rename. History tables have no foreign key, so a new
-symbol would be collected beside snapshots that stay on the old one.
+There is no rename. History tables have no foreign key, so a new symbol
+would be collected beside snapshots that stay on the old one.
 """
 
 from __future__ import annotations
@@ -14,12 +13,6 @@ import psycopg
 
 
 class Ticker:
-    """A watchlist primary key already normalized by apply.
-
-    The constructor rejects an empty string so a blank row cannot be built
-    from a read. Callers that still have raw text pass a command to apply.
-    """
-
     __slots__ = ("value",)
 
     def __init__(self, value: str) -> None:
@@ -30,8 +23,6 @@ class Ticker:
 
 @dataclass(frozen=True)
 class Member:
-    """One watchlist row. members() orders these by ticker ascending."""
-
     ticker: Ticker
     pinned: bool
     added_at: dt.datetime
@@ -39,29 +30,21 @@ class Member:
 
 @dataclass(frozen=True)
 class Add:
-    """Raw text from a caller. apply strips and uppercases it."""
-
     ticker: str
 
 
 @dataclass(frozen=True)
 class Pin:
-    """Set pinned true. The row must already exist."""
-
     ticker: str
 
 
 @dataclass(frozen=True)
 class Unpin:
-    """Set pinned false. The row must already exist."""
-
     ticker: str
 
 
 @dataclass(frozen=True)
 class Remove:
-    """Delete the watchlist row only. History stays."""
-
     ticker: str
 
 
@@ -81,16 +64,12 @@ class Removed:
 
 @dataclass(frozen=True)
 class Rejected:
-    """Admission refused. message is the sentence suggestions already builds."""
-
     ticker: str
     message: str
 
 
 @dataclass(frozen=True)
 class Missing:
-    """Pin or unpin named a symbol that is not a row."""
-
     ticker: Ticker
 
 
@@ -98,11 +77,6 @@ Applied = Stored | Removed | Rejected | Missing
 
 
 def members(conn: psycopg.Connection) -> tuple[Member, ...]:
-    """Every watchlist row, ticker ascending.
-
-    No pinned filter and no second sort. db.get_watchlist is the symbol
-    projection of this tuple, so the worker cannot drift onto a subset.
-    """
     rows = conn.execute(
         "SELECT ticker, pinned, added_at FROM watchlist ORDER BY ticker"
     ).fetchall()
@@ -110,7 +84,6 @@ def members(conn: psycopg.Connection) -> tuple[Member, ...]:
 
 
 def apply(conn: psycopg.Connection, command: Command) -> Applied:
-    """The only write. A second call converges. It does not refresh added_at or pinned."""
     if not isinstance(command, (Add, Pin, Unpin, Remove)):
         raise TypeError("apply takes Add, Pin, Unpin, or Remove")
     symbol = command.ticker.strip().upper()
@@ -157,12 +130,6 @@ def _add(conn: psycopg.Connection, symbol: str) -> Applied:
 
 
 def _admit_new(conn: psycopg.Connection, symbol: str) -> Rejected | None:
-    """Same door as the dashboard Add button.
-
-    An existing row never reaches here, so a repeat does not ask the provider.
-    Blocking source refusals stop the write. underlying_has_options False stops
-    it too. None, or a provider with no such method, still inserts.
-    """
     from app import catalogue, providers, suggestions
 
     provider = providers.get_provider()

@@ -1,10 +1,3 @@
-"""Token-gated watchlist API.
-
-The dashboard on 8501 has no login. This process is the other port.
-A missing token exits before a socket is opened and before a database
-connection is opened. The secret is a sha256 digest from that point on.
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -20,19 +13,18 @@ _BODY_LIMIT = 4096
 _READ_CAP = 4097
 
 
+_ADMITTED = object()
+
+
 class Grant:
-    """Proof that admit accepted the header. It stores nothing.
+    __slots__ = ()
 
-    Callers cannot construct it. admit builds it with object.__new__.
-    """
-
-    def __init__(self) -> None:
-        raise RuntimeError("call admit")
+    def __init__(self, seal: object) -> None:
+        if seal is not _ADMITTED:
+            raise RuntimeError("call admit")
 
 
 class Presented:
-    """The bearer value from one request, kept only as a digest."""
-
     __slots__ = ("_digest",)
 
     def __init__(self, secret: str) -> None:
@@ -46,13 +38,6 @@ class Presented:
 
 
 class Gate:
-    """GAMMAGRID_API_TOKEN after from_env has popped it.
-
-    Only the sha256 digest is kept. repr and str are the word redacted so a
-    traceback cannot print the secret. Comparison is hmac.compare_digest on
-    the two digests.
-    """
-
     __slots__ = ("_digest",)
 
     def __init__(self, digest: bytes) -> None:
@@ -84,17 +69,10 @@ class Response:
 
 
 def log_request(method: str, path: str, status: int) -> None:
-    """The only log line. There is no header argument and no body argument."""
     print(f"{method} {path} {status}", flush=True)
 
 
 def serve() -> None:
-    """Process entry. python -m app.ticker_http.
-
-    Load GAMMAGRID_API_TOKEN first. Unset or blank exits before any socket
-    and before any database connection. The exit text does not include the
-    value. Default bind is 127.0.0.1 and default port is 8741.
-    """
     gate = Gate.from_env()
     if gate is None:
         sys.stderr.write("GAMMAGRID_API_TOKEN is unset or blank\n")
@@ -114,17 +92,12 @@ def serve() -> None:
 
 
 def _admit(authorization: str | None, gate: Gate) -> Grant | None:
-    """Bearer scheme, then a SHA-256 digest compared with hmac.compare_digest.
-
-    Missing header, wrong scheme, and wrong secret all return None.
-    This function does not log.
-    """
     if authorization is None or not authorization.startswith("Bearer "):
         return None
     presented = Presented(authorization[len("Bearer "):])
     if not gate.accepts(presented):
         return None
-    return object.__new__(Grant)
+    return Grant(_ADMITTED)
 
 
 def _handle(client: socket.socket, gate: Gate) -> None:
@@ -157,7 +130,6 @@ def _handle(client: socket.socket, gate: Gate) -> None:
             log_request(method, path, response.status)
             _write(client, response)
             # Close with unread bytes becomes a TCP reset, and the 400 is lost.
-            # Drain at most the same cap. Do not parse what comes off the socket.
             _drain(client, len(prefetched))
             return
         body = _collect_body(client, prefetched, length if isinstance(length, int) else None)
@@ -219,7 +191,6 @@ def _content_length(headers: dict[str, str]) -> int | None | str:
 
 
 def _collect_body(client: socket.socket, prefetched: bytes, content_length: int | None) -> bytes | None:
-    """At most 4097 body bytes. None means the body is over the limit or short of Content-Length."""
     if len(prefetched) > _BODY_LIMIT:
         return None
     buf = bytearray(prefetched)
@@ -274,7 +245,6 @@ def _pending(client: socket.socket, count: int) -> bytes:
 
 
 def _respond(grant: Grant, method: str, path: str, body: bytes) -> Response:
-    """Map one granted request onto members or apply."""
     if not isinstance(grant, Grant):
         return _error(401, "unauthorized")
     if path == "/tickers":
