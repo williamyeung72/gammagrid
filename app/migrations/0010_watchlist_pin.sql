@@ -1,0 +1,2 @@
+ALTER TABLE watchlist
+    ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT false;

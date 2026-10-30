@@ -120,8 +120,11 @@ def check_put_call_ratio_matches_sql():
 
     This one needs a database — the throwaway one this module points at from
     its very first line."""
+    from app.watchlist import Add, apply
+
     conn = db.get_connection()
-    db.add_ticker(conn, "UNIT")
+    with testdb.admit_without_asking_the_source():
+        apply(conn, Add("UNIT"))
     base = datetime(2026, 7, 1, 21, 0)
     for step in range(3):
         chain = pd.DataFrame([
@@ -237,9 +240,54 @@ def check_watchlist_and_snapshot_dates():
     """Removing a ticker takes it off the list without touching what was
     already collected — the one rule this project will not break — and
     get_snapshot_dates backs the Replay selector."""
+    from app.watchlist import (
+        Add, Missing, Pin, Rejected, Remove, Removed, Stored, Unpin, apply,
+    )
+
     conn = db.get_connection()
-    db.add_ticker(conn, "WATCH")
+    with testdb.admit_without_asking_the_source():
+        first = apply(conn, Add(" watch "))
+    assert isinstance(first, Stored) and first.created
+    assert first.member.ticker.value == "WATCH"
+    assert first.member.pinned is False
     assert "WATCH" in db.get_watchlist(conn)
+
+    pinned = apply(conn, Pin("watch"))
+    assert isinstance(pinned, Stored) and pinned.member.pinned is True
+    again = apply(conn, Pin("WATCH"))
+    assert again.member.pinned is True and again.member.added_at == first.member.added_at
+
+    from app import providers
+
+    class Asks:
+        name = "yahoo"
+        unsupported_symbols: dict = {}
+
+        def underlying_has_options(self, ticker):
+            raise AssertionError(ticker)
+
+    previous = providers.get_provider
+    providers.get_provider = lambda name=None, token=None: Asks()
+    try:
+        repeat = apply(conn, Add("WATCH"))
+    finally:
+        providers.get_provider = previous
+    assert isinstance(repeat, Stored) and not repeat.created
+    assert repeat.member.added_at == first.member.added_at
+    assert repeat.member.pinned is True
+
+    before_empty = db.get_watchlist(conn)
+    empty = apply(conn, Add("   "))
+    assert isinstance(empty, Rejected) and empty.message == "Ticker is empty."
+    assert db.get_watchlist(conn) == before_empty
+
+    contracts = conn.execute(
+        "SELECT count(*) FROM tracked_contracts WHERE ticker = %s", ("WATCH",)
+    ).fetchone()[0]
+    assert contracts == 0
+
+    unpinned = apply(conn, Unpin("Watch"))
+    assert isinstance(unpinned, Stored) and unpinned.member.pinned is False
 
     chain = pd.DataFrame([{
         "expiry": "2026-09-18", "strike": 100.0, "option_type": "call",
@@ -253,11 +301,53 @@ def check_watchlist_and_snapshot_dates():
     dates = db.get_snapshot_dates(conn, "WATCH")
     assert len(dates) == 2 and dates == sorted(dates), dates
 
-    db.remove_ticker(conn, "WATCH")
+    removed = apply(conn, Remove("WATCH"))
+    assert isinstance(removed, Removed)
     assert "WATCH" not in db.get_watchlist(conn)
     assert len(db.get_snapshots(conn, "WATCH", days=None)) == 2, (
         "removing a ticker from the watchlist must never delete its collected history"
     )
+    assert isinstance(apply(conn, Remove("watch")), Removed)
+    missing = apply(conn, Pin("WATCH"))
+    assert isinstance(missing, Missing)
+    assert "WATCH" not in db.get_watchlist(conn)
+
+    class NoChain:
+        name = "yahoo"
+        unsupported_symbols: dict = {}
+
+        def underlying_has_options(self, ticker):
+            return False
+
+    class Unknown:
+        name = "yahoo"
+        unsupported_symbols: dict = {}
+
+        def underlying_has_options(self, ticker):
+            return None
+
+    class Bare:
+        name = "yahoo"
+        unsupported_symbols: dict = {}
+
+    providers.get_provider = lambda name=None, token=None: NoChain()
+    try:
+        refused = apply(conn, Add("NOCHAIN"))
+        assert isinstance(refused, Rejected)
+        assert "NOCHAIN" not in db.get_watchlist(conn)
+        providers.get_provider = lambda name=None, token=None: Unknown()
+        allowed = apply(conn, Add("MAYBE"))
+        assert isinstance(allowed, Stored) and allowed.created
+        providers.get_provider = lambda name=None, token=None: Bare()
+        bare = apply(conn, Add("BARE"))
+        assert isinstance(bare, Stored) and bare.created
+    finally:
+        providers.get_provider = previous
+    apply(conn, Remove("MAYBE"))
+    apply(conn, Remove("BARE"))
+    blocked = apply(conn, Add("vix"))
+    assert isinstance(blocked, Rejected)
+    assert "VIX" not in db.get_watchlist(conn)
     conn.close()
     print("watchlist and snapshot-date checks passed")
 
@@ -870,11 +960,13 @@ def check_disk_estimate_counts_every_ticker_in_a_pass():
     """
     from app import config
     from app import db as database
+    from app.watchlist import Add, apply
 
     conn = db.get_connection()
     testdb.truncate_all(conn)
-    for ticker in ("DISKA", "DISKB", "DISKC"):
-        db.add_ticker(conn, ticker)
+    with testdb.admit_without_asking_the_source():
+        for ticker in ("DISKA", "DISKB", "DISKC"):
+            apply(conn, Add(ticker))
     live = (dt.date.today() + dt.timedelta(days=90)).isoformat()
 
     def chain(rows: int) -> pd.DataFrame:
@@ -916,7 +1008,10 @@ def check_disk_estimate_counts_every_ticker_in_a_pass():
 
     # Nothing collected at all is zero, which the caption reads as "collect first".
     testdb.truncate_all(conn)
-    db.add_ticker(conn, "DISKC")
+    from app.watchlist import Add, apply
+
+    with testdb.admit_without_asking_the_source():
+        apply(conn, Add("DISKC"))
     assert database.rows_per_pass_by_ticker(conn) == {"DISKC": None}
     assert database.estimated_growth_mb_per_month(conn, 60) == 0.0
     testdb.truncate_all(conn)
@@ -2662,6 +2757,148 @@ def check_day_summaries_are_written_and_filled_in():
     print("day-summary storage checks passed (upsert, the previous day, backfill, and its second run)")
 
 
+def check_ticker_http_refuses_a_bad_token_and_pins_a_row():
+    import io
+    import json
+    import socket
+    import threading
+    from contextlib import redirect_stdout
+
+    from app import ticker_http
+
+    secret = "super-secret-token"
+    os.environ["GAMMAGRID_API_TOKEN"] = "   "
+    assert ticker_http.Gate.from_env() is None
+    os.environ["GAMMAGRID_API_TOKEN"] = secret
+    try:
+        gate = ticker_http.Gate.from_env()
+    finally:
+        os.environ.pop("GAMMAGRID_API_TOKEN", None)
+    assert gate is not None
+    assert str(gate) == "redacted" and repr(gate) == "redacted"
+    presented = ticker_http.Presented(secret)
+    assert str(presented) == "redacted" and repr(presented) == "redacted"
+    assert secret not in repr(gate) and secret not in str(presented)
+
+    def raw_request(method, path, token, body=b"", length=None):
+        if length is None:
+            length = len(body)
+        head = (
+            f"{method} {path} HTTP/1.1\r\n"
+            f"Authorization: Bearer {token}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {length}\r\n"
+            "\r\n"
+        )
+        return head.encode("ascii") + body
+
+    def roundtrip(payload: bytes) -> tuple[int, bytes, str]:
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        box: dict[str, str] = {}
+
+        def once():
+            conn, _addr = server.accept()
+            try:
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    ticker_http._handle(conn, gate)
+                box["log"] = buf.getvalue()
+            finally:
+                conn.close()
+                server.close()
+
+        client = socket.create_connection(server.getsockname(), timeout=5)
+        try:
+            client.sendall(payload)
+            client.shutdown(socket.SHUT_WR)
+            thread = threading.Thread(target=once)
+            thread.start()
+            chunks = []
+            while True:
+                data = client.recv(4096)
+                if not data:
+                    break
+                chunks.append(data)
+        finally:
+            client.close()
+        thread.join(timeout=5)
+        raw = b"".join(chunks)
+        head, _, resp_body = raw.partition(b"\r\n\r\n")
+        status = int(head.split(b" ", 2)[1])
+        return status, resp_body, box.get("log", "")
+
+    calls = {"n": 0}
+    original = db.get_connection
+
+    def boom():
+        calls["n"] += 1
+        raise AssertionError("database opened")
+
+    db.get_connection = boom
+    try:
+        status, resp_body, log = roundtrip(raw_request("POST", "/tickers", "wrong", b"not-json"))
+        assert status == 401, (status, resp_body)
+        assert json.loads(resp_body) == {"error": "unauthorized"}
+        assert calls["n"] == 0
+        assert "POST /tickers 401" in log
+        assert secret not in log and "wrong" not in log and "not-json" not in log
+        status, resp_body, log = roundtrip(raw_request("POST", "/tickers", secret, b"not-json"))
+        assert status == 400, (status, resp_body)
+        assert calls["n"] == 0
+        assert "not-json" not in log and secret not in log
+        status, resp_body, log = roundtrip(
+            raw_request("POST", "/tickers", secret, b"x" * 4097, length=4)
+        )
+        assert status == 400, status
+        assert json.loads(resp_body)["message"] == "The request body is too large."
+        assert calls["n"] == 0
+        assert secret not in log
+        status, resp_body, log = roundtrip(
+            raw_request("POST", "/tickers", secret, b"x" * 4097, length=4097)
+        )
+        assert status == 400, (status, resp_body)
+        assert json.loads(resp_body)["message"] == "The request body is too large."
+        assert calls["n"] == 0
+    finally:
+        db.get_connection = original
+
+    from app.watchlist import Add, Remove, Stored, apply, members
+
+    conn = original()
+    try:
+        with testdb.admit_without_asking_the_source():
+            created = apply(conn, Add("HTTPIN"))
+        assert isinstance(created, Stored) and created.created and created.member.pinned is False
+        before = db.get_watchlist(conn)
+        contracts = conn.execute(
+            "SELECT count(*) FROM tracked_contracts WHERE ticker = %s", ("HTTPIN",)
+        ).fetchone()[0]
+        status, resp_body, log = roundtrip(raw_request("POST", "/tickers", "wrong", b"not-json"))
+        assert status == 401 and json.loads(resp_body) == {"error": "unauthorized"}
+        assert db.get_watchlist(conn) == before
+        assert secret not in log and "not-json" not in log
+        status, resp_body, log = roundtrip(
+            raw_request("PATCH", "/tickers/httpin", secret, b'{"pinned":true}')
+        )
+        assert status == 200, (status, resp_body)
+        payload = json.loads(resp_body)
+        assert payload["ticker"] == "HTTPIN" and payload["pinned"] is True
+        assert secret not in log
+        assert db.get_watchlist(conn) == before
+        pinned = [member for member in members(conn) if member.ticker.value == "HTTPIN"]
+        assert len(pinned) == 1 and pinned[0].pinned is True
+        after = conn.execute(
+            "SELECT count(*) FROM tracked_contracts WHERE ticker = %s", ("HTTPIN",)
+        ).fetchone()[0]
+        assert contracts == 0 and after == 0
+    finally:
+        apply(conn, Remove("HTTPIN"))
+        conn.close()
+    print("ticker http checks passed")
+
+
 def main():
     # Start from an empty database, like the other two suites already do. This
     # one did not, and got away with it only because nothing it left behind
@@ -2719,6 +2956,7 @@ def main():
     check_the_day_row_and_the_ladder()
     check_a_day_is_a_session_that_opened()
     check_day_summaries_are_written_and_filled_in()
+    check_ticker_http_refuses_a_bad_token_and_pins_a_row()
     print("\nALL UNIT CHECKS PASSED")
 
 if __name__ == "__main__":

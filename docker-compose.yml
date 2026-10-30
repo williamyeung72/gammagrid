@@ -47,5 +47,22 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  api:
+    # Off for a default `docker compose up`. A missing GAMMAGRID_API_TOKEN
+    # exits this process, so an install that never set one would crash-loop.
+    profiles: ["api"]
+    build: .
+    command: ["python", "-m", "app.ticker_http"]
+    ports:
+      - "127.0.0.1:8741:8741"
+    environment:
+      - DATABASE_URL=postgresql://gammagrid:gammagrid@postgres:5432/gammagrid
+      - GAMMAGRID_API_BIND=0.0.0.0
+      - GAMMAGRID_API_TOKEN=${GAMMAGRID_API_TOKEN:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   gammagrid-data:

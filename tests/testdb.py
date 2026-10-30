@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+from contextlib import contextmanager
 from urllib.parse import urlparse
 
 DEFAULT_TEST_URL = "postgresql://gammagrid:gammagrid@localhost:5432/gammagrid_test"
@@ -49,6 +50,26 @@ def configure() -> str:
             f"    DATABASE_URL={DEFAULT_TEST_URL} python tests/coverage_report.py"
         )
     return url
+
+
+@contextmanager
+def admit_without_asking_the_source():
+    from app import providers
+
+    class Open:
+        name = "yahoo"
+        unsupported_symbols: dict[str, str | None] = {}
+
+    previous = providers.get_provider
+
+    def get_provider(name=None, token=None):
+        return Open()
+
+    providers.get_provider = get_provider
+    try:
+        yield
+    finally:
+        providers.get_provider = previous
 
 
 def truncate_all(conn) -> None:
