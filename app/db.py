@@ -48,19 +48,11 @@ def get_connection() -> psycopg.Connection:
 
 # --- watchlist ---
 
-def add_ticker(conn: psycopg.Connection, ticker: str) -> None:
-    conn.execute("INSERT INTO watchlist (ticker) VALUES (%s) ON CONFLICT DO NOTHING", (ticker.upper(),))
-    conn.commit()
-
-
-def remove_ticker(conn: psycopg.Connection, ticker: str) -> None:
-    conn.execute("DELETE FROM watchlist WHERE ticker = %s", (ticker.upper(),))
-    conn.commit()
-
-
 def get_watchlist(conn: psycopg.Connection) -> list[str]:
-    rows = conn.execute("SELECT ticker FROM watchlist ORDER BY ticker").fetchall()
-    return [r[0] for r in rows]
+    """Symbols in ticker order. Pin is not a parameter and not a filter."""
+    from app.watchlist import members
+
+    return [member.ticker.value for member in members(conn)]
 
 
 # The one SQL definition of the volume-weighted average IV, used by the rollup

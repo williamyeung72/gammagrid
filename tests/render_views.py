@@ -173,8 +173,11 @@ def seed(db) -> None:
     One expiry is deliberately today's — the case that used to leave the GEX
     chart blank, and the one that makes the heatmap fall back to a single
     tradeable expiry."""
+    from app.watchlist import Add, apply
+
     conn = db.get_connection()
-    db.add_ticker(conn, "RENDERTEST")
+    with testdb.admit_without_asking_the_source():
+        apply(conn, Add("RENDERTEST"))
     today = datetime.utcnow().date()
     base = datetime.utcnow().replace(microsecond=0) - timedelta(hours=3)
     rows = []

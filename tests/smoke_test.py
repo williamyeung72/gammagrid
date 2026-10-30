@@ -909,8 +909,11 @@ def main():
     testdb.truncate_all(reset)
     reset.close()
 
+    from app.watchlist import Add, apply
+
     conn = db.get_connection()
-    db.add_ticker(conn, "TEST")
+    with testdb.admit_without_asking_the_source():
+        apply(conn, Add("TEST"))
     assert db.get_watchlist(conn) == ["TEST"]
 
     # Six CONSECUTIVE TRADING days starting Monday 06.07.2026, not six calendar

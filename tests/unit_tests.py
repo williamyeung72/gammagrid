@@ -120,8 +120,11 @@ def check_put_call_ratio_matches_sql():
 
     This one needs a database — the throwaway one this module points at from
     its very first line."""
+    from app.watchlist import Add, apply
+
     conn = db.get_connection()
-    db.add_ticker(conn, "UNIT")
+    with testdb.admit_without_asking_the_source():
+        apply(conn, Add("UNIT"))
     base = datetime(2026, 7, 1, 21, 0)
     for step in range(3):
         chain = pd.DataFrame([
@@ -237,9 +240,54 @@ def check_watchlist_and_snapshot_dates():
     """Removing a ticker takes it off the list without touching what was
     already collected — the one rule this project will not break — and
     get_snapshot_dates backs the Replay selector."""
+    from app.watchlist import (
+        Add, Missing, Pin, Rejected, Remove, Removed, Stored, Unpin, apply,
+    )
+
     conn = db.get_connection()
-    db.add_ticker(conn, "WATCH")
+    with testdb.admit_without_asking_the_source():
+        first = apply(conn, Add(" watch "))
+    assert isinstance(first, Stored) and first.created
+    assert first.member.ticker.value == "WATCH"
+    assert first.member.pinned is False
     assert "WATCH" in db.get_watchlist(conn)
+
+    pinned = apply(conn, Pin("watch"))
+    assert isinstance(pinned, Stored) and pinned.member.pinned is True
+    again = apply(conn, Pin("WATCH"))
+    assert again.member.pinned is True and again.member.added_at == first.member.added_at
+
+    from app import providers
+
+    class Asks:
+        name = "yahoo"
+        unsupported_symbols: dict = {}
+
+        def underlying_has_options(self, ticker):
+            raise AssertionError(ticker)
+
+    previous = providers.get_provider
+    providers.get_provider = lambda name=None, token=None: Asks()
+    try:
+        repeat = apply(conn, Add("WATCH"))
+    finally:
+        providers.get_provider = previous
+    assert isinstance(repeat, Stored) and not repeat.created
+    assert repeat.member.added_at == first.member.added_at
+    assert repeat.member.pinned is True
+
+    before_empty = db.get_watchlist(conn)
+    empty = apply(conn, Add("   "))
+    assert isinstance(empty, Rejected) and empty.message == "Ticker is empty."
+    assert db.get_watchlist(conn) == before_empty
+
+    contracts = conn.execute(
+        "SELECT count(*) FROM tracked_contracts WHERE ticker = %s", ("WATCH",)
+    ).fetchone()[0]
+    assert contracts == 0
+
+    unpinned = apply(conn, Unpin("Watch"))
+    assert isinstance(unpinned, Stored) and unpinned.member.pinned is False
 
     chain = pd.DataFrame([{
         "expiry": "2026-09-18", "strike": 100.0, "option_type": "call",
@@ -253,11 +301,53 @@ def check_watchlist_and_snapshot_dates():
     dates = db.get_snapshot_dates(conn, "WATCH")
     assert len(dates) == 2 and dates == sorted(dates), dates
 
-    db.remove_ticker(conn, "WATCH")
+    removed = apply(conn, Remove("WATCH"))
+    assert isinstance(removed, Removed)
     assert "WATCH" not in db.get_watchlist(conn)
     assert len(db.get_snapshots(conn, "WATCH", days=None)) == 2, (
         "removing a ticker from the watchlist must never delete its collected history"
     )
+    assert isinstance(apply(conn, Remove("watch")), Removed)
+    missing = apply(conn, Pin("WATCH"))
+    assert isinstance(missing, Missing)
+    assert "WATCH" not in db.get_watchlist(conn)
+
+    class NoChain:
+        name = "yahoo"
+        unsupported_symbols: dict = {}
+
+        def underlying_has_options(self, ticker):
+            return False
+
+    class Unknown:
+        name = "yahoo"
+        unsupported_symbols: dict = {}
+
+        def underlying_has_options(self, ticker):
+            return None
+
+    class Bare:
+        name = "yahoo"
+        unsupported_symbols: dict = {}
+
+    providers.get_provider = lambda name=None, token=None: NoChain()
+    try:
+        refused = apply(conn, Add("NOCHAIN"))
+        assert isinstance(refused, Rejected)
+        assert "NOCHAIN" not in db.get_watchlist(conn)
+        providers.get_provider = lambda name=None, token=None: Unknown()
+        allowed = apply(conn, Add("MAYBE"))
+        assert isinstance(allowed, Stored) and allowed.created
+        providers.get_provider = lambda name=None, token=None: Bare()
+        bare = apply(conn, Add("BARE"))
+        assert isinstance(bare, Stored) and bare.created
+    finally:
+        providers.get_provider = previous
+    apply(conn, Remove("MAYBE"))
+    apply(conn, Remove("BARE"))
+    blocked = apply(conn, Add("vix"))
+    assert isinstance(blocked, Rejected)
+    assert "VIX" not in db.get_watchlist(conn)
     conn.close()
     print("watchlist and snapshot-date checks passed")
 
@@ -870,11 +960,13 @@ def check_disk_estimate_counts_every_ticker_in_a_pass():
     """
     from app import config
     from app import db as database
+    from app.watchlist import Add, apply
 
     conn = db.get_connection()
     testdb.truncate_all(conn)
-    for ticker in ("DISKA", "DISKB", "DISKC"):
-        db.add_ticker(conn, ticker)
+    with testdb.admit_without_asking_the_source():
+        for ticker in ("DISKA", "DISKB", "DISKC"):
+            apply(conn, Add(ticker))
     live = (dt.date.today() + dt.timedelta(days=90)).isoformat()
 
     def chain(rows: int) -> pd.DataFrame:
@@ -916,7 +1008,10 @@ def check_disk_estimate_counts_every_ticker_in_a_pass():
 
     # Nothing collected at all is zero, which the caption reads as "collect first".
     testdb.truncate_all(conn)
-    db.add_ticker(conn, "DISKC")
+    from app.watchlist import Add, apply
+
+    with testdb.admit_without_asking_the_source():
+        apply(conn, Add("DISKC"))
     assert database.rows_per_pass_by_ticker(conn) == {"DISKC": None}
     assert database.estimated_growth_mb_per_month(conn, 60) == 0.0
     testdb.truncate_all(conn)

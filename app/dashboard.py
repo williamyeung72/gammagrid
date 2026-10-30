@@ -30,6 +30,7 @@ from app import (  # noqa: I001 — grouped by what they are, not alphabetised
     weather,
 )
 from app.metrics_core import GAMMA_FLIP_MAX_DISTANCE
+from app.watchlist import Add, Remove, Rejected, apply, members
 from app.viewtime import (
     format_date,
     format_datetime,
@@ -81,24 +82,6 @@ def _drop_stale_choice(key: str, options) -> None:
 @st.cache_data(ttl=300)
 def _cached_catalogue_options(_conn, watched: tuple[str, ...]) -> list[tuple[str, str]]:
     return catalogue.options(_conn, list(watched))
-
-
-@st.cache_data(ttl=1800)
-def _cached_has_options(ticker: str) -> bool | None:
-    """Does this symbol have a chain to collect — asked once per symbol.
-
-    Cached because it is a network call sitting behind a button somebody may
-    press twice, and because the answer for a given symbol does not change
-    within half an hour. `None` is cached too, and deliberately: when the
-    source could not answer, the ticker is accepted, so there is nothing to
-    re-ask.
-
-    Called through getattr rather than as a plain method — a provider written
-    against the published interface need not have this, and a missing method
-    means "cannot find out", which is the same as None.
-    """
-    check = getattr(providers.get_provider(), "underlying_has_options", None)
-    return None if check is None else check(ticker)
 
 
 @st.cache_data(ttl=1800)
@@ -502,7 +485,8 @@ st.caption(
 
 with st.sidebar:
     st.header("Watchlist")
-    watchlist = db.get_watchlist(conn)
+    roster = members(conn)
+    watchlist = [member.ticker.value for member in roster]
 
     # ONE BOX THAT FILTERS AS YOU TYPE, and it replaced a plain text field for a
     # reason that has nothing to do with looks. A field you can only type into
@@ -617,28 +601,10 @@ with st.sidebar:
             )
 
     if st.button("Add", disabled=not new_ticker or bool(_proposal and _proposal.blocking)):
-        # THE LIVE CHECK STILL RUNS, and the catalogue does not replace it: the
-        # directory says a symbol has listed options somewhere, not that Yahoo
-        # will serve its chain. `is False` and not `not ...` — None means the
-        # source could not answer, and a ticker must never be refused on that. A
-        # false negative here looks like the product being broken; a false
-        # positive shows up in the collection log within the hour and is
-        # suspended by itself after six.
-        if _cached_has_options(new_ticker) is False:
-            # A symbol the directory lists is not "not a ticker". The limitation
-            # is ours, and saying otherwise costs the message its credibility
-            # with exactly the person who knows the symbol is real.
-            st.error(
-                suggestions.source_refusal(
-                    new_ticker, _unsupported_here.get(new_ticker), _provider.name
-                )
-                if new_ticker in _catalogue_symbols
-                else suggestions.refusal(
-                    new_ticker, watchlist, _catalogue_symbols.__contains__
-                )
-            )
+        result = apply(conn, Add(new_ticker))
+        if isinstance(result, Rejected):
+            st.error(result.message)
         else:
-            db.add_ticker(conn, new_ticker)
             _cached_collection_depth.clear()
             _cached_catalogue_options.clear()
             st.rerun()
@@ -649,10 +615,14 @@ with st.sidebar:
     # from "collecting fine" without a mark here.
     suspended = db.unresolvable_tickers(conn)
     current_ticker = st.session_state.get("selected_ticker")
-    for ticker in watchlist:
+    for member in roster:
+        ticker = member.ticker.value
+        label = f"{ticker} pinned" if member.pinned else ticker
+        if ticker in suspended:
+            label = f"⏸ {label}"
         col1, col2 = st.columns([3, 1])
         if col1.button(
-            f"⏸ {ticker}" if ticker in suspended else ticker,
+            label,
             key=f"select_ticker_{ticker}",
             type="primary" if ticker == current_ticker else "secondary",
             use_container_width=True,
@@ -665,7 +635,7 @@ with st.sidebar:
             st.session_state["selected_ticker"] = ticker
             st.rerun()
         if col2.button("✕", key=f"remove_{ticker}"):
-            db.remove_ticker(conn, ticker)
+            apply(conn, Remove(ticker))
             if st.session_state.get("selected_ticker") == ticker:
                 # otherwise on the next run the selectbox would receive a value
                 # that is no longer among its options, and crash
